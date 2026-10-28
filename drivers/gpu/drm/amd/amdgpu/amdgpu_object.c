@@ -43,6 +43,7 @@
 #include "amdgpu_vram_mgr.h"
 #include "amdgpu_vm.h"
 #include "amdgpu_dma_buf.h"
+#include "kfd_svm.h"
 
 /**
  * DOC: amdgpu_object
@@ -93,7 +94,8 @@ static void amdgpu_bo_user_destroy(struct ttm_buffer_object *tbo)
 bool amdgpu_bo_is_amdgpu_bo(struct ttm_buffer_object *bo)
 {
 	if (bo->destroy == &amdgpu_bo_destroy ||
-	    bo->destroy == &amdgpu_bo_user_destroy)
+	    bo->destroy == &amdgpu_bo_user_destroy ||
+	    bo->destroy == &svm_range_bo_destroy)
 		return true;
 
 	return false;
@@ -198,6 +200,14 @@ void amdgpu_bo_placement_from_domain(struct amdgpu_bo *abo, u32 domain)
 		places[c].fpfn = 0;
 		places[c].lpfn = 0;
 		places[c].mem_type = AMDGPU_PL_OA;
+		places[c].flags = 0;
+		c++;
+	}
+
+	if (domain & AMDGPU_GEM_DOMAIN_NPA) {
+		places[c].fpfn = 0;
+		places[c].lpfn = 0;
+		places[c].mem_type = AMDGPU_PL_NPA;
 		places[c].flags = 0;
 		c++;
 	}
@@ -1050,7 +1060,8 @@ static const char * const amdgpu_vram_names[] = {
 	"LPDDR4",
 	"LPDDR5",
 	"HBM3E",
-	"HBM4"
+	"HBM4",
+	"GDDR7"
 };
 
 /**
@@ -1660,6 +1671,9 @@ u64 amdgpu_bo_print_info(int id, struct amdgpu_bo *bo, struct seq_file *m)
 				break;
 			case AMDGPU_PL_MMIO_REMAP:
 				placement = "MMIO REMAP";
+				break;
+			case AMDGPU_PL_NPA:
+				placement = "NPA";
 				break;
 			case TTM_PL_SYSTEM:
 			default:

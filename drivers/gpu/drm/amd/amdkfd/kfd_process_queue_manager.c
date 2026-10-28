@@ -210,6 +210,7 @@ static void pqm_clean_queue_resource(struct process_queue_manager *pqm,
 	}
 
 	if (dev->kfd->shared_resources.enable_mes) {
+		amdgpu_mes_free_gang_ctx_index(&dev->adev->mes, pqn->q->gang_ctx_array_index);
 		amdgpu_amdkfd_free_kernel_mem(dev->adev, &pqn->q->gang_ctx_bo);
 		amdgpu_amdkfd_free_kernel_mem(dev->adev, (void **)&pqn->q->wptr_bo_gart);
 	}
@@ -282,7 +283,15 @@ static int init_user_queue(struct process_queue_manager *pqm,
 			goto cleanup;
 		}
 		memset((*q)->gang_ctx_cpu_ptr, 0, AMDGPU_MES_GANG_CTX_SIZE);
-
+		/* Bind one MES gang context slot per queue (gang). */
+		if (dev->adev->mes.use_rs64mem) {
+			retval = amdgpu_mes_alloc_gang_ctx_index(&dev->adev->mes,
+						&(*q)->gang_ctx_array_index);
+			if (retval) {
+				pr_err("failed to allocate gang context index slot\n");
+				goto cleanup;
+			}
+		}
 		/* Starting with GFX11, wptr BOs must be mapped to GART for MES to determine work
 		 * on unmapped queues for usermode queue oversubscription (no aggregated doorbell)
 		 */
@@ -304,6 +313,7 @@ static int init_user_queue(struct process_queue_manager *pqm,
 	return 0;
 
 free_gang_ctx_bo:
+	amdgpu_mes_free_gang_ctx_index(&dev->adev->mes, (*q)->gang_ctx_array_index);
 	amdgpu_amdkfd_free_kernel_mem(dev->adev, &(*q)->gang_ctx_bo);
 cleanup:
 	uninit_queue(*q);
@@ -329,12 +339,13 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 	unsigned int max_queues = 127; /* HWS limit */
 
 	/*
-	 * On GFX 9.4.3/9.5.0, increase the number of queues that
-	 * can be created to 255. No HWS limit on GFX 9.4.3/9.5.0.
+	 * On GFX 9.4.3/9.5.0/12.1.0, increase the number of queues that
+	 * can be created to 255. No HWS limit on GFX 9.4.3/9.5.0/12.1.0.
 	 */
 	if (KFD_GC_VERSION(dev) == IP_VERSION(9, 4, 3) ||
 	    KFD_GC_VERSION(dev) == IP_VERSION(9, 4, 4) ||
-	    KFD_GC_VERSION(dev) == IP_VERSION(9, 5, 0))
+	    KFD_GC_VERSION(dev) == IP_VERSION(9, 5, 0) ||
+	    KFD_GC_VERSION(dev) == IP_VERSION(12, 1, 0))
 		max_queues = 255;
 
 	q = NULL;
@@ -383,9 +394,20 @@ int pqm_create_queue(struct process_queue_manager *pqm,
 						     false);
 		if (retval) {
 			dev_err(dev->adev->dev, "failed to allocate process context bo\n");
-			return retval;
+			goto err_allocate_pqn;
 		}
 		memset(pdd->proc_ctx_cpu_ptr, 0, AMDGPU_MES_PROC_CTX_SIZE);
+		/* Bind one MES process context slot to the whole process
+		 * (per device); every queue of this process reuses it.
+		 */
+		if (dev->adev->mes.use_rs64mem) {
+			retval = amdgpu_mes_alloc_proc_ctx_index(&dev->adev->mes,
+						&pdd->proc_ctx_array_index);
+			if (retval) {
+				dev_err(dev->adev->dev, "failed to allocate process context index\n");
+				goto err_allocate_pqn;
+			}
+		}
 	}
 
 	pqn = kzalloc_obj(*pqn);
@@ -642,7 +664,8 @@ int pqm_update_mqd(struct process_queue_manager *pqm,
 
 	/* ASICs that have WGPs must enforce pairwise enabled mask checks. */
 	if (minfo && minfo->cu_mask.ptr &&
-			KFD_GC_VERSION(pqn->q->device) >= IP_VERSION(10, 0, 0)) {
+			KFD_GC_VERSION(pqn->q->device) >= IP_VERSION(10, 0, 0) &&
+			KFD_GC_VERSION(pqn->q->device) < IP_VERSION(12, 1, 0)) {
 		int i;
 
 		for (i = 0; i < minfo->cu_mask.count; i += 2) {
@@ -1055,7 +1078,7 @@ int kfd_criu_restore_queue(struct kfd_process *p,
 	ctl_stack = mqd + q_data->mqd_size;
 
 	memset(&qp, 0, sizeof(qp));
-	set_queue_properties_from_criu(&qp, q_data, NUM_XCC(pdd->dev->adev->gfx.xcc_mask));
+	set_queue_properties_from_criu(&qp, q_data, NUM_XCC(pdd->dev->xcc_mask));
 
 	print_queue_properties(&qp);
 
@@ -1148,13 +1171,13 @@ int pqm_debugfs_mqds(struct seq_file *m, void *data)
 			mqd_mgr = q->device->dqm->mqd_mgrs[mqd_type];
 			size = mqd_mgr->mqd_stride(mqd_mgr,
 							&q->properties);
-		}
 
-		for (xcc = 0; xcc < num_xccs; xcc++) {
-			mqd = q->mqd + size * xcc;
-			r = mqd_mgr->debugfs_show_mqd(m, mqd);
-			if (r != 0)
-				break;
+			for (xcc = 0; xcc < num_xccs; xcc++) {
+				mqd = q->mqd + size * xcc;
+				r = mqd_mgr->debugfs_show_mqd(m, mqd);
+				if (r != 0)
+					break;
+			}
 		}
 	}
 

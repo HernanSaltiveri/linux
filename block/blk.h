@@ -406,7 +406,7 @@ static inline bool bio_may_need_split(struct bio *bio,
 		return true;
 
 	bv = __bvec_iter_bvec(bio->bi_io_vec, bio->bi_iter);
-	if (bio->bi_iter.bi_size > bv->bv_len - bio->bi_iter.bi_bvec_done)
+	if (bio->bi_iter.bi_size > bv->bv_len - bio->bi_iter.bi_offset)
 		return true;
 	if ((bv->bv_offset | bv->bv_len) & lim->dma_alignment)
 		return true;
@@ -577,6 +577,7 @@ int blkdev_report_zones_ioctl(struct block_device *bdev, unsigned int cmd,
 		unsigned long arg);
 int blkdev_zone_mgmt_ioctl(struct block_device *bdev, blk_mode_t mode,
 		unsigned int cmd, unsigned long arg);
+bool bdev_zone_mgmt_allowed(struct block_device *bdev, sector_t sector);
 #else /* CONFIG_BLK_DEV_ZONED */
 static inline void disk_init_zone_resources(struct gendisk *disk)
 {
@@ -618,6 +619,11 @@ static inline int blkdev_zone_mgmt_ioctl(struct block_device *bdev,
 		blk_mode_t mode, unsigned int cmd, unsigned long arg)
 {
 	return -ENOTTY;
+}
+static inline bool bdev_zone_mgmt_allowed(struct block_device *bdev,
+					  sector_t sector)
+{
+	return false;
 }
 #endif /* CONFIG_BLK_DEV_ZONED */
 

@@ -45,6 +45,7 @@
 #define CEPH_MOUNT_OPT_ASYNC_DIROPS    (1<<15) /* allow async directory ops */
 #define CEPH_MOUNT_OPT_NOPAGECACHE     (1<<16) /* bypass pagecache altogether */
 #define CEPH_MOUNT_OPT_SPARSEREAD      (1<<17) /* always do sparse reads */
+#define CEPH_MOUNT_OPT_NEARFULL_SYNC   (1<<18) /* sync writes when nearfull */
 
 #define CEPH_MOUNT_OPT_DEFAULT			\
 	(CEPH_MOUNT_OPT_DCACHE |		\
@@ -203,7 +204,19 @@ struct ceph_fs_client {
  */
 struct ceph_cap {
 	struct ceph_inode_info *ci;
-	struct rb_node ci_node;          /* per-ci cap tree */
+
+	/**
+	 * Per-ci cap tree.  Protected with
+	 * `ceph_inode_info.i_ceph_lock`.
+	 *
+	 * Clearing this field with RB_CLEAR_NODE() requires holding
+	 * both `ceph_inode_info.i_ceph_lock` and
+	 * `ceph_mds_session->s_cap_lock`.  Calling RB_EMPTY_NODE()
+	 * (via ceph_cap_is_removed()) requires holding at least one
+	 * of these.
+	 */
+	struct rb_node ci_node;
+
 	struct ceph_mds_session *session;
 	struct list_head session_caps;   /* per-session caplist */
 	u64 cap_id;       /* unique cap id (mds provided) */
@@ -468,7 +481,8 @@ struct ceph_inode_info {
 	struct mutex i_truncate_mutex;
 	u32 i_truncate_seq;        /* last truncate to smaller size */
 	u64 i_truncate_size;       /*  and the size we last truncated down to */
-	int i_truncate_pending;    /*  still need to call vmtruncate */
+	bool i_truncate_pending;   /*  still need to call vmtruncate */
+	bool i_truncate_shrank;		/* Truncate shrank the file */
 	/*
 	 * For none fscrypt case it equals to i_truncate_size or it will
 	 * equals to fscrypt_file_size
@@ -641,6 +655,15 @@ static inline int ceph_ino_compare(struct inode *inode, void *data)
 #define CEPH_MDS_INO_LOG_OFFSET		(2 * CEPH_MAX_MDS)
 #define CEPH_INO_SYSTEM_BASE		((6*CEPH_MAX_MDS) + (CEPH_MAX_MDS * CEPH_NUM_STRAY))
 
+/*
+ * Upper bound on the number of delegated inodes a single MDS session may
+ * hold. The MDS normally hands out a small preallocation window (the
+ * userspace mds_client_prealloc_inos option defaults to 1000) and refills
+ * it as the client consumes entries. This leaves generous headroom while
+ * bounding the CPU and memory a malformed delegation interval can consume.
+ */
+#define CEPH_MAX_DELEG_INOS		8192
+
 static inline bool ceph_vino_is_reserved(const struct ceph_vino vino)
 {
 	if (vino.ino >= CEPH_INO_SYSTEM_BASE ||
@@ -687,6 +710,10 @@ static inline struct inode *ceph_find_inode(struct super_block *sb,
 #define CEPH_I_ASYNC_CREATE_BIT		(12) /* async create in flight for this */
 #define CEPH_I_SHUTDOWN_BIT		(13) /* inode is no longer usable */
 #define CEPH_I_ASYNC_CHECK_CAPS_BIT	(14) /* check caps after async creating finishes */
+#define CEPH_I_FLUSH_FORCE_BIT		(15) /* a revoke's response was deferred;
+					      * force a cap message to the MDS once
+					      * the deferred work completes
+					      */
 
 #define CEPH_I_DIR_ORDERED		(1 << CEPH_I_DIR_ORDERED_BIT)
 #define CEPH_I_FLUSH			(1 << CEPH_I_FLUSH_BIT)
@@ -699,6 +726,7 @@ static inline struct inode *ceph_find_inode(struct super_block *sb,
 #define CEPH_I_ODIRECT			(1 << CEPH_I_ODIRECT_BIT)
 #define CEPH_I_ASYNC_CREATE		(1 << CEPH_I_ASYNC_CREATE_BIT)
 #define CEPH_I_SHUTDOWN			(1 << CEPH_I_SHUTDOWN_BIT)
+#define CEPH_I_FLUSH_FORCE		(1 << CEPH_I_FLUSH_FORCE_BIT)
 
 /*
  * Masks of ceph inode work.
@@ -1139,18 +1167,18 @@ static inline int ceph_do_getattr(struct inode *inode, int mask, bool force)
 {
 	return __ceph_do_getattr(inode, NULL, mask, force);
 }
-extern int ceph_permission(struct mnt_idmap *idmap,
+extern int ceph_permission(const struct mnt_idmap *idmap,
 			   struct inode *inode, int mask);
 
 struct ceph_iattr {
 	struct ceph_fscrypt_auth	*fscrypt_auth;
 };
 
-extern int __ceph_setattr(struct mnt_idmap *idmap, struct inode *inode,
+extern int __ceph_setattr(const struct mnt_idmap *idmap, struct inode *inode,
 			  struct iattr *attr, struct ceph_iattr *cia);
-extern int ceph_setattr(struct mnt_idmap *idmap,
+extern int ceph_setattr(const struct mnt_idmap *idmap,
 			struct dentry *dentry, struct iattr *attr);
-extern int ceph_getattr(struct mnt_idmap *idmap,
+extern int ceph_getattr(const struct mnt_idmap *idmap,
 			const struct path *path, struct kstat *stat,
 			u32 request_mask, unsigned int flags);
 void ceph_inode_shutdown(struct inode *inode);
@@ -1225,7 +1253,7 @@ void ceph_release_acl_sec_ctx(struct ceph_acl_sec_ctx *as_ctx);
 #ifdef CONFIG_CEPH_FS_POSIX_ACL
 
 struct posix_acl *ceph_get_acl(struct inode *, int, bool);
-int ceph_set_acl(struct mnt_idmap *idmap,
+int ceph_set_acl(const struct mnt_idmap *idmap,
 		 struct dentry *dentry, struct posix_acl *acl, int type);
 int ceph_pre_init_acls(struct inode *dir, umode_t *mode,
 		       struct ceph_acl_sec_ctx *as_ctx);
@@ -1269,8 +1297,22 @@ extern void ceph_add_cap(struct inode *inode,
 			 unsigned issued, unsigned wanted,
 			 unsigned cap, unsigned seq, u64 realmino, int flags,
 			 struct ceph_cap **new_cap);
-extern void __ceph_remove_cap(struct ceph_cap *cap, bool queue_release);
+
+/**
+ * Determine whether __ceph_remove_cap() has been called on this #cap
+ * (but the object has not yet been freed because it is protected by
+ * `ceph_mds_session.s_cap_iterator`).
+ *
+ * Caller must lock either `ceph_inode_info.i_ceph_lock` or
+ * `ceph_mds_session.s_cap_lock`.
+ */
+static inline bool ceph_cap_is_removed(const struct ceph_cap *cap)
+{
+	return RB_EMPTY_NODE(&cap->ci_node);
+}
+
 extern void ceph_remove_cap(struct ceph_mds_client *mdsc, struct ceph_cap *cap,
+			    struct ceph_inode_info *ci,
 			    bool queue_release);
 extern void __ceph_remove_caps(struct ceph_inode_info *ci);
 extern void ceph_put_cap(struct ceph_mds_client *mdsc,
